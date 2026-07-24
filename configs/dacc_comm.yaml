@@ -1,0 +1,26 @@
+paths:
+  image_dir: data/Set11
+  run_dir: dacc_runs/dacc_comm
+  network_log: data/network/network_log.csv
+  tabnet_controller: dacc_runs/models/tabnet_controller.pt
+  image_model: dacc_runs/models/resnet18_image_model.pt
+  quantized_image_model: dacc_runs/models/resnet18_image_model_ptq.pt
+
+network_defaults:
+  velocity: 15.0
+  distance: 50.0
+  data_rate: 1.2
+  rssi: -70.0
+  buffer_max: 2560
+
+compression:
+  ratios: [10, 20, 30, 40, 50, 60]
+  default_window_size: 1024
+
+torch_training:
+  controller_backend: pytorch_tabnet_response
+  controller_epochs: 150
+  image_epochs: 150
+  patch_size: 256
+  block_size: 33
+  universal_matrix_shape: [1089, 1089]
