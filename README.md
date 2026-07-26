@@ -27,15 +27,19 @@ Image model training data:
 
 ## Train Controller
 
-The controller uses `pytorch-tabnet` model:
+The controller uses one shared multi-head `pytorch-tabnet` model:
 
 ```text
-g(V,d,Dr,Rs,W) -> packet_loss
-h(V,d,Dr,Rs,C) -> latency
+velocity,distance,data_rate,rssi -> window_size,compression_ratio
 ```
 
-Inference enumerates candidate window sizes and compression ratios and selects
-the lowest predicted response.
+During training, repeated network/action rows are grouped by network condition.
+The target `window_size` and `compression_ratio` are selected from the same row
+with the best combined packet-loss/latency score:
+
+```text
+score = alpha * normalized_packet_loss + beta * normalized_latency
+```
 
 ```bash
 python scripts/dacc_comm.py train-torch-controller \
@@ -44,6 +48,8 @@ python scripts/dacc_comm.py train-torch-controller \
   --epochs 150 \
   --batch-size 64 \
   --lr 0.001 \
+  --alpha 1.0 \
+  --beta 1.0 \
   --device cuda
 ```
 

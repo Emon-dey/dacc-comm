@@ -18,7 +18,7 @@ compression:
   default_window_size: 1024
 
 torch_training:
-  controller_backend: pytorch_tabnet_response
+  controller_backend: multihead_pytorch_tabnet
   controller_epochs: 150
   image_epochs: 150
   patch_size: 256

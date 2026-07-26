@@ -27,6 +27,35 @@ def _torch() -> tuple[Any, Any, Any]:
     return torch, F, (DataLoader, Dataset)
 
 
+def _normalize_action_values(values: pd.Series) -> pd.Series:
+    span = float(values.max() - values.min())
+    if span <= 1e-12:
+        return pd.Series(np.zeros(len(values), dtype=np.float32), index=values.index)
+    return (values - float(values.min())) / span
+
+
+def _controller_training_targets(df: pd.DataFrame, alpha: float, beta: float) -> pd.DataFrame:
+    rows = []
+    for _, group in df.groupby(FEATURE_COLUMNS, sort=False):
+        packet_loss_score = _normalize_action_values(group["packet_loss"])
+        latency_score = _normalize_action_values(group["latency"])
+        best_idx = (alpha * packet_loss_score + beta * latency_score).idxmin()
+        best_row = group.loc[best_idx]
+        base = {column: float(best_row[column]) for column in FEATURE_COLUMNS}
+        base.update(
+            {
+                "target_window_size": float(best_row["window_size"]),
+                "target_compression_ratio": float(best_row["compression_ratio"]),
+                "selected_packet_loss": float(best_row["packet_loss"]),
+                "selected_latency": float(best_row["latency"]),
+            }
+        )
+        rows.append(base)
+    if not rows:
+        raise ValueError("controller training CSV is empty")
+    return pd.DataFrame(rows)
+
+
 def train_controller(
     csv_path: str | Path,
     output: str | Path,
@@ -36,11 +65,10 @@ def train_controller(
     device: str = "cpu",
     alpha: float = 1.0,
     beta: float = 1.0,
-    aux_weight: float = 0.05,
 ) -> None:
     torch, F, (DataLoader, Dataset) = _torch()
     try:
-        from pytorch_tabnet.tab_model import TabNetRegressor
+        from pytorch_tabnet.tab_network import TabNetNoEmbeddings
     except ImportError as exc:
         raise RuntimeError(
             "pytorch-tabnet is required for train-torch-controller. "
@@ -52,82 +80,80 @@ def train_controller(
     if missing:
         raise ValueError(f"missing required columns: {missing}")
 
-    x_raw = df[FEATURE_COLUMNS].to_numpy(dtype=np.float32)
-    window = df["window_size"].to_numpy(dtype=np.float32)
+    scenario_rows = _controller_training_targets(df, alpha, beta)
+    x_raw = scenario_rows[FEATURE_COLUMNS].to_numpy(dtype=np.float32)
+    window = scenario_rows["target_window_size"].to_numpy(dtype=np.float32)
     ratio_values = np.array((10, 20, 30, 40, 50, 60), dtype=np.int64)
-    ratio = df["compression_ratio"].to_numpy(dtype=np.int64)
-    ratio_idx = np.array([int(np.argmin(np.abs(ratio_values - r))) for r in ratio], dtype=np.int64)
-    packet_loss = df["packet_loss"].to_numpy(dtype=np.float32)
-    latency = df["latency"].to_numpy(dtype=np.float32)
+    ratio = scenario_rows["target_compression_ratio"].to_numpy(dtype=np.int64)
     cfg = TorchDaccConfig()
     mean = x_raw.mean(axis=0)
     std = np.maximum(x_raw.std(axis=0), 1e-6)
     x = (x_raw - mean) / std
     window_norm = ((window - cfg.window_min) / (cfg.window_max - cfg.window_min)).clip(0.0, 1.0)
     ratio_norm = (ratio.astype(np.float32) / 100.0).clip(0.0, 1.0)
-    packet_loss_mean = np.float32(packet_loss.mean())
-    packet_loss_std = np.float32(max(packet_loss.std(), 1e-6))
-    latency_mean = np.float32(latency.mean())
-    latency_std = np.float32(max(latency.std(), 1e-6))
-    packet_loss_z = (packet_loss - packet_loss_mean) / packet_loss_std
-    latency_z = (latency - latency_mean) / latency_std
 
-    loss_x = np.column_stack([x, window_norm]).astype(np.float32)
-    loss_y = packet_loss_z.reshape(-1, 1).astype(np.float32)
-    latency_x = np.column_stack([x, ratio_norm]).astype(np.float32)
-    latency_y = latency_z.reshape(-1, 1).astype(np.float32)
-    common_params = {
-        "n_d": 16,
-        "n_a": 16,
-        "n_steps": 4,
-        "gamma": 1.3,
-        "lambda_sparse": 1e-3,
-        "optimizer_fn": torch.optim.AdamW,
-        "optimizer_params": {"lr": lr},
-        "mask_type": "sparsemax",
-        "device_name": device,
-        "seed": 7,
-        "verbose": 0,
-    }
-    packet_loss_model = TabNetRegressor(**common_params)
-    latency_model = TabNetRegressor(**common_params)
-    packet_loss_model.fit(
-        loss_x,
-        loss_y,
-        max_epochs=epochs,
-        batch_size=batch_size,
-        virtual_batch_size=max(1, min(batch_size, 32)),
-        patience=0,
-        drop_last=False,
-    )
-    latency_model.fit(
-        latency_x,
-        latency_y,
-        max_epochs=epochs,
-        batch_size=batch_size,
-        virtual_batch_size=max(1, min(batch_size, 32)),
-        patience=0,
-        drop_last=False,
-    )
+    targets = np.column_stack([window_norm, ratio_norm]).astype(np.float32)
+
+    class ControllerDataset(Dataset):
+        def __init__(self, features: np.ndarray, labels: np.ndarray) -> None:
+            self.features = torch.from_numpy(features.astype(np.float32))
+            self.labels = torch.from_numpy(labels.astype(np.float32))
+
+        def __len__(self):
+            return self.features.shape[0]
+
+        def __getitem__(self, idx):
+            return self.features[idx], self.labels[idx]
+
+    class MultiHeadTabNetController(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = TabNetNoEmbeddings(
+                input_dim=len(FEATURE_COLUMNS),
+                output_dim=32,
+                n_d=16,
+                n_a=16,
+                n_steps=4,
+                gamma=1.3,
+                mask_type="sparsemax",
+                virtual_batch_size=max(1, min(batch_size, 32)),
+            )
+            self.window_head = torch.nn.Linear(32, 1)
+            self.ratio_head = torch.nn.Linear(32, 1)
+
+        def forward(self, x):
+            shared, sparse_loss = self.backbone(x)
+            out = torch.cat([self.window_head(shared), self.ratio_head(shared)], dim=1)
+            return out, sparse_loss
+
+    model = MultiHeadTabNetController().to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    loader = DataLoader(ControllerDataset(x, targets), batch_size=batch_size, shuffle=True, drop_last=False)
+
+    for _ in range(epochs):
+        model.train()
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            pred, _ = model(xb)
+            loss = F.mse_loss(pred[:, 0], yb[:, 0]) + F.mse_loss(pred[:, 1], yb[:, 1])
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "controller_backend": "pytorch_tabnet_response",
-            "packet_loss_model": packet_loss_model,
-            "latency_model": latency_model,
+            "controller_backend": "multihead_pytorch_tabnet",
+            "controller_state_dict": model.state_dict(),
             "feature_mean": mean,
             "feature_std": std,
             "feature_columns": FEATURE_COLUMNS,
             "ratios": ratio_values,
-            "window_candidates": np.arange(cfg.window_min, cfg.window_max + 1, 10, dtype=np.int64),
-            "packet_loss_mean": packet_loss_mean,
-            "packet_loss_std": packet_loss_std,
-            "latency_mean": latency_mean,
-            "latency_std": latency_std,
-            "controller_loss": "TabNet g(V,d,Dr,Rs,W)->packet_loss and h(V,d,Dr,Rs,C)->latency; inference minimizes predicted responses",
+            "window_min": cfg.window_min,
+            "window_max": cfg.window_max,
+            "controller_loss": "shared TabNet backbone with window-size and compression-ratio heads; targets selected by alpha*normalized_packet_loss + beta*normalized_latency",
             "alpha": float(alpha),
             "beta": float(beta),
-            "aux_weight": float(aux_weight),
         },
         output,
     )
@@ -135,25 +161,58 @@ def train_controller(
 
 def predict_controller(checkpoint: str | Path, features: dict[str, float], device: str = "cpu") -> dict[str, float]:
     torch, _, _ = _torch()
+    try:
+        from pytorch_tabnet.tab_network import TabNetNoEmbeddings
+    except ImportError as exc:
+        raise RuntimeError(
+            "pytorch-tabnet is required for predict-torch-controller. "
+            "Install it with `python -m pip install pytorch-tabnet` in the active environment."
+        ) from exc
     payload = torch.load(checkpoint, map_location=device, weights_only=False)
-    if payload.get("controller_backend") != "pytorch_tabnet_response":
+    if payload.get("controller_backend") != "multihead_pytorch_tabnet":
         raise RuntimeError("unsupported controller checkpoint; train a new checkpoint with train-torch-controller")
     cfg = TorchDaccConfig()
     mean = payload["feature_mean"]
     std = payload["feature_std"]
     ratios = payload["ratios"].astype(np.int64)
-    windows = payload["window_candidates"].astype(np.int64)
     x = np.array([features[c] for c in FEATURE_COLUMNS], dtype=np.float32)
     x = (x - mean) / std
-    window_norm = ((windows.astype(np.float32) - cfg.window_min) / (cfg.window_max - cfg.window_min)).clip(0.0, 1.0)
-    loss_x = np.column_stack([np.repeat(x[None, :], len(windows), axis=0), window_norm])
-    packet_loss_pred = payload["packet_loss_model"].predict(loss_x.astype(np.float32)).reshape(-1)
-    ratio_norm = (ratios.astype(np.float32) / 100.0).clip(0.0, 1.0)
-    latency_x = np.column_stack([np.repeat(x[None, :], len(ratios), axis=0), ratio_norm])
-    latency_pred = payload["latency_model"].predict(latency_x.astype(np.float32)).reshape(-1)
+
+    class MultiHeadTabNetController(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backbone = TabNetNoEmbeddings(
+                input_dim=len(FEATURE_COLUMNS),
+                output_dim=32,
+                n_d=16,
+                n_a=16,
+                n_steps=4,
+                gamma=1.3,
+                mask_type="sparsemax",
+                virtual_batch_size=32,
+            )
+            self.window_head = torch.nn.Linear(32, 1)
+            self.ratio_head = torch.nn.Linear(32, 1)
+
+        def forward(self, x):
+            shared, sparse_loss = self.backbone(x)
+            return torch.cat([self.window_head(shared), self.ratio_head(shared)], dim=1), sparse_loss
+
+    model = MultiHeadTabNetController().to(device)
+    model.load_state_dict(payload["controller_state_dict"])
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(torch.from_numpy(x[None, :].astype(np.float32)).to(device))
+    window_norm = float(pred[0, 0].detach().cpu().clamp(0.0, 1.0))
+    ratio_norm = float(pred[0, 1].detach().cpu().clamp(0.0, 1.0))
+    window_min = int(payload.get("window_min", cfg.window_min))
+    window_max = int(payload.get("window_max", cfg.window_max))
+    window = int(round(window_min + window_norm * (window_max - window_min)))
+    ratio_pred = ratio_norm * 100.0
+    ratio = int(ratios[int(np.argmin(np.abs(ratios.astype(np.float32) - ratio_pred)))])
     return {
-        "window_size": int(windows[int(np.argmin(packet_loss_pred))]),
-        "compression_ratio": int(ratios[int(np.argmin(latency_pred))]),
+        "window_size": window,
+        "compression_ratio": ratio,
     }
 
 

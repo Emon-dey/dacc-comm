@@ -67,7 +67,6 @@ def cmd_train_torch_controller(args: argparse.Namespace) -> None:
             args.device,
             args.alpha,
             args.beta,
-            args.aux_weight,
         )
     )
     print(f"wrote {args.output}")
@@ -160,9 +159,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--alpha", type=float, default=1.0, help="compatibility metadata; response TabNet training uses packet-loss labels directly")
-    p.add_argument("--beta", type=float, default=1.0, help="compatibility metadata; response TabNet training uses latency labels directly")
-    p.add_argument("--aux-weight", type=float, default=0.05, help="compatibility metadata retained in the checkpoint")
+    p.add_argument("--alpha", type=float, default=1.0, help="packet-loss weight in combined action score")
+    p.add_argument("--beta", type=float, default=1.0, help="latency weight in combined action score")
     p.set_defaults(func=cmd_train_torch_controller)
 
     p = sub.add_parser("predict-torch-controller")
